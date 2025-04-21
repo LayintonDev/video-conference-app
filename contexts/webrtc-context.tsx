@@ -1421,7 +1421,7 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
 
       // Set up disconnect handler
       onDisconnect(participantRef).remove();
-
+      console.log("Setting up disconnect handler", currentRoomId);
       // Set up WebRTC listeners
       setupWebRTCListeners(roomId, currentRoom);
 
