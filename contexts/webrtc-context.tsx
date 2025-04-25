@@ -67,11 +67,14 @@ const WebRTCContext = createContext<WebRTCContextType | null>(null);
 // Enhanced ICE server configuration with more STUN/TURN servers for better connectivity
 const configuration = {
   iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
+    // { urls: "stun:stun.l.google.com:19302" },
+    // { urls: "stun:stun1.l.google.com:19302" },
+    // { urls: "stun:stun2.l.google.com:19302" },
+    // { urls: "stun:stun3.l.google.com:19302" },
+    // { urls: "stun:stun4.l.google.com:19302" },
+    {
+      urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"],
+    },
     {
       urls: "turn:openrelay.metered.ca:80",
       username: "openrelayproject",
@@ -833,10 +836,16 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Create a peer connection
   const createPeerConnection = (peerId: string, initiator = false) => {
+    if (!user || !currentRoomId) {
+      console.warn(
+        "Cannot create peer connection: user or currentRoomId is missing."
+      );
+      return;
+    }
     // If we already have a connection to this peer, close it
     if (peerConnections.current[peerId]) {
-      console.log(`Closing existing connection to peer ${peerId}`);
-      peerConnections.current[peerId].close();
+      console.log(`Peer connection already exists for ${peerId}`);
+      return;
     }
 
     console.log(
@@ -844,6 +853,9 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
     );
     const peerConnection = new RTCPeerConnection(configuration);
     peerConnections.current[peerId] = peerConnection;
+
+    // Logging
+    const logPrefix = `[${peerId}]`;
 
     // Add local tracks to the peer connection
     if (localStream) {
@@ -861,7 +873,7 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
 
     // Handle ICE candidates
     peerConnection.onicecandidate = (event) => {
-      if (event.candidate && currentRoomId && user) {
+      if (event.candidate) {
         console.log(
           `Generated ICE candidate for peer ${peerId}:`,
           event.candidate
@@ -880,32 +892,32 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
         `ICE connection state change: ${peerConnection.iceConnectionState} for peer ${peerId}`
       );
 
-      if (
-        peerConnection.iceConnectionState === "connected" ||
-        peerConnection.iceConnectionState === "completed"
-      ) {
-        console.log(`Connection to peer ${peerId} established successfully`);
-        setConnectionStatus("connected");
-      } else if (peerConnection.iceConnectionState === "failed") {
-        console.log(
-          `ICE connection to peer ${peerId} failed, attempting to restart ICE`
-        );
-        peerConnection.restartIce();
-        setConnectionStatus("failed");
-      } else if (peerConnection.iceConnectionState === "disconnected") {
-        console.log(
-          `ICE connection to peer ${peerId} disconnected, waiting for reconnection`
-        );
-        setConnectionStatus("disconnected");
+      // if (
+      //   peerConnection.iceConnectionState === "connected" ||
+      //   peerConnection.iceConnectionState === "completed"
+      // ) {
+      //   console.log(`Connection to peer ${peerId} established successfully`);
+      //   setConnectionStatus("connected");
+      // } else if (peerConnection.iceConnectionState === "failed") {
+      //   console.log(
+      //     `ICE connection to peer ${peerId} failed, attempting to restart ICE`
+      //   );
+      //   peerConnection.restartIce();
+      //   setConnectionStatus("failed");
+      // } else if (peerConnection.iceConnectionState === "disconnected") {
+      //   console.log(
+      //     `ICE connection to peer ${peerId} disconnected, waiting for reconnection`
+      //   );
+      //   setConnectionStatus("disconnected");
 
-        // Try to restart ICE after a short delay
-        setTimeout(() => {
-          if (peerConnection.iceConnectionState === "disconnected") {
-            console.log(`Attempting to restart ICE for peer ${peerId}`);
-            peerConnection.restartIce();
-          }
-        }, 2000);
-      }
+      //   // Try to restart ICE after a short delay
+      //   setTimeout(() => {
+      //     if (peerConnection.iceConnectionState === "disconnected") {
+      //       console.log(`Attempting to restart ICE for peer ${peerId}`);
+      //       peerConnection.restartIce();
+      //     }
+      //   }, 2000);
+      // }
     };
 
     // Handle connection state changes
@@ -921,6 +933,9 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
         peerConnection.connectionState === "failed" ||
         peerConnection.connectionState === "closed"
       ) {
+        peerConnections.current[peerId]?.close();
+        delete peerConnections.current[peerId];
+
         console.log(`Connection to peer ${peerId} failed or closed`);
         setConnectionStatus("failed");
       }
@@ -975,33 +990,33 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
       });
     };
 
-    console.log("current room id", currentRoomId);
-    // Create and send offer if initiator
-    if (initiator && currentRoomId && user) {
-      peerConnection
-        .createOffer()
-        .then((offer) => {
-          console.log(`Created offer for peer ${peerId}:`, offer);
-          return peerConnection.setLocalDescription(offer);
-        })
-        .then(() => {
-          console.log(`Sending offer to peer ${peerId}`);
-          const offerRef = ref(
-            rtdb,
-            `rooms/${currentRoomId}/offers/${user.uid}/${peerId}`
-          );
-          set(offerRef, {
-            type: "offer",
-            sdp: peerConnection.localDescription?.sdp,
-          });
-        })
-        .catch((error) => {
-          console.error("Error creating offer:", error);
-          setWebRTCError(
-            "Failed to create connection offer. Please try again."
-          );
-        });
-    }
+    // console.log("current room id", currentRoomId);
+    // // Create and send offer if initiator
+    // if (initiator && currentRoomId && user) {
+    //   peerConnection
+    //     .createOffer()
+    //     .then((offer) => {
+    //       console.log(`Created offer for peer ${peerId}:`, offer);
+    //       return peerConnection.setLocalDescription(offer);
+    //     })
+    //     .then(() => {
+    //       console.log(`Sending offer to peer ${peerId}`);
+    //       const offerRef = ref(
+    //         rtdb,
+    //         `rooms/${currentRoomId}/offers/${user.uid}/${peerId}`
+    //       );
+    //       set(offerRef, {
+    //         type: "offer",
+    //         sdp: peerConnection.localDescription?.sdp,
+    //       });
+    //     })
+    //     .catch((error) => {
+    //       console.error("Error creating offer:", error);
+    //       setWebRTCError(
+    //         "Failed to create connection offer. Please try again."
+    //       );
+    //     });
+    // }
 
     return peerConnection;
   };
@@ -1311,6 +1326,7 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           setConnectionStatus("connecting");
         }
       } else {
+        console.log("No peers connected, disconnecting...");
         setConnectionStatus("disconnected");
       }
     }, 5000);
@@ -1463,6 +1479,7 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
     peerConnections.current = {};
     setPeers([]);
     setCurrentRoomId(null);
+    console.log("Dsconnecting fromh here instead");
     setConnectionStatus("disconnected");
 
     // Stop screen sharing if active

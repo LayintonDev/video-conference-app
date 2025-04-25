@@ -157,6 +157,13 @@ export default function RoomPage() {
       !user ||
       !roomExists
     ) {
+      console.log("Returning with params:", {
+        setupCompleted: setupCompletedRef.current,
+        setupStarted: setupStartedRef.current,
+        roomId: roomIdRef.current,
+        user: user,
+        roomExists: roomExists,
+      });
       return;
     }
 
@@ -492,7 +499,7 @@ export default function RoomPage() {
   } else {
     gridCols = 3;
   }
-
+  console.log("PEERS:", peers);
   return (
     <div className="flex h-screen flex-col bg-gray-50 dark:bg-gray-900">
       {webRTCError && (
