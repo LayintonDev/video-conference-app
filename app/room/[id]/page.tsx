@@ -262,13 +262,14 @@ export default function RoomPage() {
     roomExists,
   ]);
 
-  // Effect to update local video
+  // Update the useEffect for local video
   useEffect(() => {
-    if (localStream && localVideoRef.current) {
-      localVideoRef.current.srcObject = localStream;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = mediaState.hasVideo
+        ? localStream
+        : null;
     }
-  }, [localStream]);
-  console.log("localstream:", localStream);
+  }, [localStream, mediaState.hasVideo]);
 
   // Effect to scroll chat to bottom
   useEffect(() => {
@@ -750,6 +751,18 @@ export default function RoomPage() {
               className={`grid h-full gap-4 grid-cols-1 md:grid-cols-${gridCols}`}
             >
               <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                {/* Always render the video element, hide if no video */}
+                <video
+                  ref={localVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={`h-full w-full object-cover ${
+                    !mediaState.hasVideo ? "hidden" : ""
+                  }`}
+                />
+
+                {/* Show fallback if no video/audio */}
                 {!mediaState.hasVideo && !mediaState.hasAudio && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-800 text-white">
                     <AlertTriangle className="h-12 w-12 mb-2 text-yellow-400" />
@@ -767,16 +780,7 @@ export default function RoomPage() {
                   </div>
                 )}
 
-                {mediaState.hasVideo && (
-                  <video
-                    ref={localVideoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="h-full w-full object-cover"
-                  />
-                )}
-
+                {/* Show audio-only fallback */}
                 {!mediaState.hasVideo && mediaState.hasAudio && (
                   <div className="absolute inset-0 flex items-center justify-center bg-gray-800 text-white">
                     <div className="text-center">
