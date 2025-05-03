@@ -246,9 +246,9 @@ export default function RoomPage() {
     return () => {
       if (setupCompletedRef.current) {
         console.log("Cleaning up room page");
-        leaveWebRTCRoom();
-        leaveRoom();
-        setRoomId(null);
+        // leaveWebRTCRoom();
+        // leaveRoom();
+        // setRoomId(null);
       }
     };
   }, [
@@ -268,6 +268,7 @@ export default function RoomPage() {
       localVideoRef.current.srcObject = localStream;
     }
   }, [localStream]);
+  console.log("localstream:", localStream);
 
   // Effect to scroll chat to bottom
   useEffect(() => {
@@ -323,7 +324,7 @@ export default function RoomPage() {
   const handleReconnect = async () => {
     setIsReconnecting(true);
     try {
-      await reconnectPeers();
+      await reconnectPeers(roomIdRef.current!);
     } catch (error) {
       console.error("Error reconnecting:", error);
       setWebRTCError(
@@ -500,6 +501,7 @@ export default function RoomPage() {
     gridCols = 3;
   }
   console.log("PEERS:", peers);
+  console.log("error:", webRTCError);
   return (
     <div className="flex h-screen flex-col bg-gray-50 dark:bg-gray-900">
       {webRTCError && (
@@ -523,7 +525,7 @@ export default function RoomPage() {
         </div>
       )}
 
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+      <header className="fixed top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container flex h-16 items-center justify-between">
           <div className="flex items-center gap-2">
             <h1 className="font-bold text-xl">{displayRoom.name}</h1>
@@ -842,12 +844,7 @@ export default function RoomPage() {
                   className="relative aspect-video bg-black rounded-lg overflow-hidden"
                 >
                   {peer.stream ? (
-                    <video
-                      autoPlay
-                      playsInline
-                      srcObject={peer.stream}
-                      className="h-full w-full object-cover"
-                    />
+                    <PeerVideo key={peer.id} stream={peer.stream} />
                   ) : (
                     <div className="flex h-full items-center justify-center bg-gray-800 text-white">
                       <div className="text-center">
@@ -1222,3 +1219,38 @@ export default function RoomPage() {
     </div>
   );
 }
+
+const PeerVideo = ({ stream }: { stream: MediaStream }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  console.log("stream here:", stream);
+
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      // Check if stream has video tracks
+      const hasVideoTrack = stream.getVideoTracks().length > 0;
+
+      if (hasVideoTrack) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch((error) => {
+          console.error("Error playing video:", error);
+        });
+      }
+    }
+
+    // Cleanup the stream when component is unmounted or stream changes
+    return () => {
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, [stream]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      className="h-full w-full object-cover"
+    />
+  );
+};
