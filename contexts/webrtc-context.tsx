@@ -65,13 +65,8 @@ type WebRTCContextType = {
 const WebRTCContext = createContext<WebRTCContextType | null>(null);
 
 // Enhanced ICE server configuration with more STUN/TURN servers for better connectivity
-const configuration = {
+const configuration: RTCConfiguration = {
   iceServers: [
-    // { urls: "stun:stun.l.google.com:19302" },
-    // { urls: "stun:stun1.l.google.com:19302" },
-    // { urls: "stun:stun2.l.google.com:19302" },
-    // { urls: "stun:stun3.l.google.com:19302" },
-    // { urls: "stun:stun4.l.google.com:19302" },
     {
       urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"],
     },
@@ -87,6 +82,9 @@ const configuration = {
     },
   ],
   iceCandidatePoolSize: 10,
+  bundlePolicy: "balanced",
+  rtcpMuxPolicy: "require",
+  iceTransportPolicy: "all",
 };
 
 export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
@@ -239,8 +237,45 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
       });
       peerConnections.current = {};
 
-      // Clear existing peers
-      setPeers([]);
+      // Keep existing peer structure but clear streams
+      setPeers((prevPeers) =>
+        prevPeers.map((peer) => ({
+          ...peer,
+          stream: undefined,
+          connection: undefined,
+        }))
+      );
+
+      // Clean up existing signaling data
+      await cleanupSignalingData(roomId, user.uid);
+
+      // Wait a moment for cleanup to propagate
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Re-setup WebRTC listeners if they were cleaned up
+      if (!listenersSetupRef.current) {
+        const roomRef = ref(rtdb, `rooms/${roomId}`);
+        const snapshot = await get(roomRef);
+        if (snapshot.exists()) {
+          const roomData = snapshot.val();
+          const currentRoom: Room = {
+            id: roomId,
+            name: roomData.name,
+            createdBy: roomData.createdBy,
+            createdAt: roomData.createdAt,
+            participants: roomData.participants || {},
+          };
+          setupWebRTCListeners(roomId, currentRoom);
+        } else {
+          throw new Error("Room not found");
+        }
+      }
+
+      // Refresh local media stream tracks in case of disconnection
+      const refreshedStream = await reinitializeMedia();
+      if (!refreshedStream) {
+        console.log("Failed to refresh media, continuing with existing stream");
+      }
 
       // Get current participants
       const participantsRef = ref(rtdb, `rooms/${roomId}/participants`);
@@ -275,9 +310,6 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           }
         );
 
-        // Clean up old signaling data
-        await cleanupSignalingData(roomId, user.uid);
-
         setConnectionStatus("connected");
       } else {
         console.log("No participants found in room");
@@ -293,19 +325,71 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
   // Clean up old signaling data
   const cleanupSignalingData = async (roomId: string, userId: string) => {
     try {
+      console.log(
+        `Cleaning up signaling data for room ${roomId} and user ${userId}`
+      );
+
       // Clean up old offers
       const offersRef = ref(rtdb, `rooms/${roomId}/offers/${userId}`);
       await remove(offersRef);
+
+      // Also clean up offers to this user from other participants
+      const allOffersRef = ref(rtdb, `rooms/${roomId}/offers`);
+      const offersSnapshot = await get(allOffersRef);
+      if (offersSnapshot.exists()) {
+        const offers = offersSnapshot.val();
+        for (const [senderId, senderOffers] of Object.entries(offers)) {
+          if (senderId !== userId) {
+            const offerToUserRef = ref(
+              rtdb,
+              `rooms/${roomId}/offers/${senderId}/${userId}`
+            );
+            await remove(offerToUserRef);
+          }
+        }
+      }
 
       // Clean up old answers
       const answersRef = ref(rtdb, `rooms/${roomId}/answers/${userId}`);
       await remove(answersRef);
 
+      // Also clean up answers to this user from other participants
+      const allAnswersRef = ref(rtdb, `rooms/${roomId}/answers`);
+      const answersSnapshot = await get(allAnswersRef);
+      if (answersSnapshot.exists()) {
+        const answers = answersSnapshot.val();
+        for (const [senderId, senderAnswers] of Object.entries(answers)) {
+          if (senderId !== userId) {
+            const answerToUserRef = ref(
+              rtdb,
+              `rooms/${roomId}/answers/${senderId}/${userId}`
+            );
+            await remove(answerToUserRef);
+          }
+        }
+      }
+
       // Clean up old ICE candidates
       const candidatesRef = ref(rtdb, `rooms/${roomId}/candidates/${userId}`);
       await remove(candidatesRef);
 
-      console.log("Cleaned up old signaling data");
+      // Also clean up candidates to this user from other participants
+      const allCandidatesRef = ref(rtdb, `rooms/${roomId}/candidates`);
+      const candidatesSnapshot = await get(allCandidatesRef);
+      if (candidatesSnapshot.exists()) {
+        const candidates = candidatesSnapshot.val();
+        for (const [senderId, senderCandidates] of Object.entries(candidates)) {
+          if (senderId !== userId && senderCandidates) {
+            const candidatesToUserRef = ref(
+              rtdb,
+              `rooms/${roomId}/candidates/${senderId}/${userId}`
+            );
+            await remove(candidatesToUserRef);
+          }
+        }
+      }
+
+      console.log("Successfully cleaned up all signaling data");
     } catch (error) {
       console.error("Error cleaning up signaling data:", error);
     }
@@ -332,8 +416,15 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           ? { deviceId: { exact: selectedAudioDevice } }
           : true,
         video: selectedVideoDevice
-          ? { deviceId: { exact: selectedVideoDevice } }
-          : true,
+          ? {
+              deviceId: { exact: selectedVideoDevice },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            }
+          : {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
       };
 
       console.log("Using media constraints:", constraints);
@@ -350,6 +441,14 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
         setHasVideo(hasVideoTrack);
         setHasAudio(hasAudioTrack);
 
+        // Make sure video and audio are initially enabled
+        stream.getVideoTracks().forEach((track) => {
+          track.enabled = isVideoEnabled;
+        });
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = isAudioEnabled;
+        });
+
         console.log(
           `Stream has video: ${hasVideoTrack}, has audio: ${hasAudioTrack}`
         );
@@ -365,8 +464,12 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           stream.getTracks().forEach((track) => {
             const sender = senders.find((s) => s.track?.kind === track.kind);
             if (sender) {
-              sender.replaceTrack(track);
+              console.log(`Replacing ${track.kind} track in peer connection`);
+              sender.replaceTrack(track).catch((err) => {
+                console.error(`Error replacing ${track.kind} track:`, err);
+              });
             } else {
+              console.log(`Adding new ${track.kind} track to peer connection`);
               pc.addTrack(track, stream);
             }
           });
@@ -388,6 +491,11 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           setHasVideo(false);
           setHasAudio(true);
 
+          // Make sure audio is initially enabled
+          audioStream.getAudioTracks().forEach((track) => {
+            track.enabled = isAudioEnabled;
+          });
+
           setLocalStream(audioStream);
           originalStream.current = audioStream;
 
@@ -395,10 +503,19 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           Object.values(peerConnections.current).forEach((pc) => {
             const senders = pc.getSenders();
 
-            audioStream.getTracks().forEach((track) => {
+            // Remove any existing video tracks from peer connections
+            const videoSender = senders.find((s) => s.track?.kind === "video");
+            if (videoSender) {
+              pc.removeTrack(videoSender);
+            }
+
+            // Add or replace audio tracks
+            audioStream.getAudioTracks().forEach((track) => {
               const sender = senders.find((s) => s.track?.kind === track.kind);
               if (sender) {
-                sender.replaceTrack(track);
+                sender.replaceTrack(track).catch((err) => {
+                  console.error(`Error replacing audio track:`, err);
+                });
               } else {
                 pc.addTrack(track, audioStream);
               }
@@ -444,8 +561,15 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           : false,
         video: video
           ? selectedVideoDevice
-            ? { deviceId: { exact: selectedVideoDevice } }
-            : true
+            ? {
+                deviceId: { exact: selectedVideoDevice },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              }
+            : {
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              }
           : false,
       };
 
@@ -462,6 +586,17 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
       setHasVideo(hasVideoTrack);
       setHasAudio(hasAudioTrack);
 
+      // Make sure video and audio are initially enabled
+      stream.getVideoTracks().forEach((track) => {
+        track.enabled = true;
+      });
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+
+      setIsVideoEnabled(true);
+      setIsAudioEnabled(true);
+
       console.log(
         `Stream has video: ${hasVideoTrack}, has audio: ${hasAudioTrack}`
       );
@@ -473,7 +608,14 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
       console.error("Error accessing media devices:", error);
 
       // Try with just audio if video fails
-      if (!video) {
+      if (video) {
+        try {
+          console.log("Video failed, trying with audio only...");
+          return initLocalStream(false, true);
+        } catch (audioError) {
+          console.error("Error getting audio-only stream:", audioError);
+        }
+      } else if (!video && audio) {
         try {
           console.log("Trying with audio only...");
           const audioOnlyStream = await navigator.mediaDevices.getUserMedia({
@@ -484,6 +626,7 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
 
           setHasVideo(false);
           setHasAudio(true);
+          setIsAudioEnabled(true);
 
           setLocalStream(audioOnlyStream);
           originalStream.current = audioOnlyStream;
@@ -839,214 +982,392 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
     peerId: string,
     roomId: string,
     initiator = false
-  ) => {
+  ): RTCPeerConnection | null => {
     if (!user || !roomId) {
       console.warn(
         "Cannot create peer connection: user or currentRoomId is missing.",
         { user, roomId }
       );
-      return;
+      return null;
     }
-    // If we already have a connection to this peer, close it
+
+    // If we already have a connection to this peer, close and recreate it
     if (peerConnections.current[peerId]) {
-      console.log(`Peer connection already exists for ${peerId}`);
-      return;
+      console.log(
+        `Closing existing peer connection for ${peerId} before creating a new one`
+      );
+      try {
+        peerConnections.current[peerId].close();
+      } catch (err) {
+        console.error(`Error closing existing peer connection:`, err);
+      }
+      delete peerConnections.current[peerId];
     }
 
-    console.log(
-      `Creating new peer connection to ${peerId}, initiator: ${initiator}`
-    );
-    const peerConnection = new RTCPeerConnection(configuration);
-    peerConnections.current[peerId] = peerConnection;
-
-    // Logging
-    const logPrefix = `[${peerId}]`;
-
-    // Add local tracks to the peer connection
-    if (localStream) {
+    try {
       console.log(
-        `Adding ${
-          localStream.getTracks().length
-        } local tracks to peer connection`
+        `Creating new peer connection to ${peerId}, initiator: ${initiator}`
       );
-      localStream.getTracks().forEach((track) => {
-        peerConnection.addTrack(track, localStream);
-      });
-    } else {
-      // Initialize local stream if not already done
-
-      console.log("Initializing local stream");
-      initLocalStream()
-        .then((stream) =>
-          stream
-            ?.getTracks()
-            .forEach((track) => peerConnection.addTrack(track, stream))
-        )
-        .catch((error: any) => {
-          const errormessage = "Failed to initialize local stream";
-          console.error(error);
-          setWebRTCError(errormessage);
-          joinAttemptedRef.current = false;
-          throw new Error(error);
-        });
-
-      console.warn("No local stream available when creating peer connection");
-    }
-
-    // Handle ICE candidates
-    peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        console.log(
-          `Generated ICE candidate for peer ${peerId}:`,
-          event.candidate
-        );
-        const candidateRef = ref(
-          rtdb,
-          `rooms/${roomId}/candidates/${user.uid}/${peerId}`
-        );
-        push(candidateRef, event.candidate.toJSON());
-      }
-    };
-
-    // Handle ICE connection state changes
-    peerConnection.oniceconnectionstatechange = () => {
-      console.log(
-        `ICE connection state change: ${peerConnection.iceConnectionState} for peer ${peerId}`
+      const peerConnection = new RTCPeerConnection(
+        configuration as RTCConfiguration
       );
+      peerConnections.current[peerId] = peerConnection;
 
-      if (
-        peerConnection.iceConnectionState === "connected" ||
-        peerConnection.iceConnectionState === "completed"
-      ) {
-        console.log(`Connection to peer ${peerId} established successfully`);
-        setConnectionStatus("connected");
-      } else if (peerConnection.iceConnectionState === "failed") {
-        console.log(
-          `ICE connection to peer ${peerId} failed, attempting to restart ICE`
-        );
-        peerConnection.restartIce();
-        setConnectionStatus("failed");
-      } else if (peerConnection.iceConnectionState === "disconnected") {
-        console.log(
-          `ICE connection to peer ${peerId} disconnected, waiting for reconnection`
-        );
-        setConnectionStatus("disconnected");
+      // Critical: Handle incoming tracks
+      peerConnection.ontrack = (event) => {
+        console.log(`Received track from peer ${peerId}:`, event.track.kind);
 
-        // Try to restart ICE after a short delay
-        setTimeout(() => {
-          if (peerConnection.iceConnectionState === "disconnected") {
-            console.log(`Attempting to restart ICE for peer ${peerId}`);
-            peerConnection.restartIce();
-          }
-        }, 2000);
-      }
-    };
-
-    // Handle connection state changes
-    peerConnection.onconnectionstatechange = () => {
-      console.log(
-        `Connection state change: ${peerConnection.connectionState} for peer ${peerId}`
-      );
-
-      if (peerConnection.connectionState === "connected") {
-        console.log(`Connection to peer ${peerId} established`);
-        setConnectionStatus("connected");
-      } else if (
-        peerConnection.connectionState === "failed" ||
-        peerConnection.connectionState === "closed"
-      ) {
-        peerConnections.current[peerId]?.close();
-        delete peerConnections.current[peerId];
-
-        console.log(`Connection to peer ${peerId} failed or closed`);
-        setConnectionStatus("failed");
-      }
-    };
-
-    // Handle signaling state changes
-    peerConnection.onsignalingstatechange = () => {
-      console.log(
-        `Signaling state change: ${peerConnection.signalingState} for peer ${peerId}`
-      );
-    };
-
-    // Handle negotiation needed
-    peerConnection.onnegotiationneeded = async () => {
-      if (initiator && roomId && user) {
-        console.log(`Negotiation needed for peer ${peerId}, creating offer`);
-        try {
-          const offer = await peerConnection.createOffer();
-          await peerConnection.setLocalDescription(offer);
-
-          console.log(`Sending offer to peer ${peerId}:`, offer);
-          const offerRef = ref(
-            rtdb,
-            `rooms/${roomId}/offers/${user.uid}/${peerId}`
+        // Use the event's streams if available (most browser implementations)
+        if (event.streams && event.streams.length > 0) {
+          const remoteStream = event.streams[0];
+          console.log(
+            `Using remote stream directly from event:`,
+            remoteStream.id
           );
-          await set(offerRef, {
-            type: "offer",
-            sdp: peerConnection.localDescription?.sdp,
+
+          setPeers((prevPeers) => {
+            return prevPeers.map((peer) => {
+              if (peer.id === peerId) {
+                console.log(
+                  `Setting stream for peer ${peerId}:`,
+                  remoteStream.id
+                );
+                return {
+                  ...peer,
+                  stream: remoteStream,
+                  connection: peerConnection,
+                };
+              }
+              return peer;
+            });
           });
-        } catch (error) {
-          console.error(`Error during negotiation with peer ${peerId}:`, error);
-          setWebRTCError("Failed to negotiate connection. Please try again.");
+        } else {
+          // Fallback if event doesn't provide streams (rare/older browsers)
+          console.log(
+            `No streams in track event, creating new stream for ${peerId}`
+          );
+          let peerStream: MediaStream | undefined;
+
+          // Try to find existing stream in peers array
+          setPeers((prevPeers) => {
+            const updatedPeers = prevPeers.map((peer) => {
+              if (peer.id === peerId) {
+                // If this peer already has a stream, add track to it
+                if (peer.stream) {
+                  peerStream = peer.stream;
+                  try {
+                    peer.stream.addTrack(event.track);
+                  } catch (err) {
+                    console.error(
+                      `Error adding track to existing stream:`,
+                      err
+                    );
+                    // Create new stream if adding track fails
+                    peerStream = new MediaStream([event.track]);
+                  }
+                  return {
+                    ...peer,
+                    stream: peerStream,
+                    connection: peerConnection,
+                  };
+                } else {
+                  // Create new stream for this peer
+                  peerStream = new MediaStream([event.track]);
+                  return {
+                    ...peer,
+                    stream: peerStream,
+                    connection: peerConnection,
+                  };
+                }
+              }
+              return peer;
+            });
+            return updatedPeers;
+          });
         }
+      };
+
+      // Add local tracks to the peer connection
+      if (localStream && localStream.getTracks().length > 0) {
+        console.log(
+          `Adding ${
+            localStream.getTracks().length
+          } local tracks to peer connection`
+        );
+        localStream.getTracks().forEach((track) => {
+          try {
+            peerConnection.addTrack(track, localStream);
+          } catch (err) {
+            console.error(
+              `Error adding ${track.kind} track to connection:`,
+              err
+            );
+          }
+        });
+      } else {
+        // Initialize local stream if not already done
+        console.log("No local stream available, initializing one");
+        initLocalStream()
+          .then((stream) => {
+            if (stream) {
+              stream.getTracks().forEach((track) => {
+                try {
+                  peerConnection.addTrack(track, stream);
+                } catch (err) {
+                  console.error(`Error adding track to connection:`, err);
+                }
+              });
+            } else {
+              console.error("Failed to initialize local stream");
+              setWebRTCError("Failed to initialize local stream");
+              joinAttemptedRef.current = false;
+            }
+          })
+          .catch((error) => {
+            const errorMessage = "Failed to initialize local stream";
+            console.error(errorMessage, error);
+            setWebRTCError(errorMessage);
+            joinAttemptedRef.current = false;
+          });
       }
-    };
 
-    // Handle incoming tracks
-    peerConnection.ontrack = (event) => {
-      console.log(`Received track from peer ${peerId}:`, event.track.kind);
-      // const newStream = new MediaStream([event.track]);
-      // console.log("Previouse peers", peers);
-      // console.log("New stream", newStream);
+      // Handle ICE candidates
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log(
+            `Generated ICE candidate for peer ${peerId}:`,
+            event.candidate
+          );
+          const candidateRef = ref(
+            rtdb,
+            `rooms/${roomId}/candidates/${user.uid}/${peerId}`
+          );
+          push(candidateRef, event.candidate.toJSON());
+        }
+      };
 
-      // let newStream = new MediaStream();
-      // event.streams[0].getTracks().forEach((track) => {
-      //   newStream.addTrack(track);
-      // });
+      // Handle ICE gathering state changes
+      peerConnection.onicegatheringstatechange = () => {
+        console.log(
+          `ICE gathering state: ${peerConnection.iceGatheringState} for peer ${peerId}`
+        );
+      };
 
-      // setPeers((prevPeers) => {
-      //   const peerIndex = prevPeers.findIndex((p) => p.id === peerId);
-      //   console.log("peer index:", peerIndex);
-      //   if (peerIndex !== -1) {
-      //     const updatedPeers = [...prevPeers];
-      //     updatedPeers[peerIndex] = {
-      //       ...updatedPeers[peerIndex],
-      //       stream: newStream,
-      //     };
-      //     return updatedPeers;
-      //   }
-      //   return prevPeers;
-      // });
+      // Handle ICE connection state changes
+      peerConnection.oniceconnectionstatechange = () => {
+        console.log(
+          `ICE connection state change: ${peerConnection.iceConnectionState} for peer ${peerId}`
+        );
 
-      setPeers((prevPeers) => {
-        const peerIndex = prevPeers.findIndex((p) => p.id === peerId);
-        if (peerIndex !== -1) {
-          const updatedPeers = [...prevPeers];
-          const existingPeer = updatedPeers[peerIndex];
-
-          let stream = existingPeer.stream || new MediaStream();
-
-          // Avoid adding duplicate tracks
-          if (!stream.getTracks().some((t) => t.id === event.track.id)) {
-            stream.addTrack(event.track);
+        if (
+          peerConnection.iceConnectionState === "connected" ||
+          peerConnection.iceConnectionState === "completed"
+        ) {
+          console.log(`Connection to peer ${peerId} established successfully`);
+          setConnectionStatus("connected");
+        } else if (peerConnection.iceConnectionState === "failed") {
+          console.log(
+            `ICE connection to peer ${peerId} failed, attempting to restart ICE`
+          );
+          try {
+            peerConnection.restartIce();
+          } catch (err) {
+            console.error(`Error restarting ICE:`, err);
           }
 
-          updatedPeers[peerIndex] = {
-            ...existingPeer,
-            stream,
-          };
+          // Update connection status, but don't set to failed unless all connections are failed
+          const allPeersFailed = Object.values(peerConnections.current).every(
+            (pc) =>
+              pc.iceConnectionState === "failed" ||
+              pc.iceConnectionState === "disconnected"
+          );
 
-          return updatedPeers;
+          if (allPeersFailed) {
+            setConnectionStatus("failed");
+          }
+        } else if (peerConnection.iceConnectionState === "disconnected") {
+          console.log(
+            `ICE connection to peer ${peerId} disconnected, waiting for reconnection`
+          );
+
+          // Only set disconnected if all connections are disconnected
+          const allPeersDisconnected = Object.values(
+            peerConnections.current
+          ).every(
+            (pc) =>
+              pc.iceConnectionState === "disconnected" ||
+              pc.iceConnectionState === "failed"
+          );
+
+          if (allPeersDisconnected) {
+            setConnectionStatus("disconnected");
+          }
+
+          // Try to restart ICE after a short delay
+          setTimeout(() => {
+            if (peerConnection.iceConnectionState === "disconnected") {
+              console.log(`Attempting to restart ICE for peer ${peerId}`);
+              try {
+                peerConnection.restartIce();
+              } catch (err) {
+                console.error(`Error restarting ICE:`, err);
+              }
+            }
+          }, 2000);
         }
-        return prevPeers;
-      });
-    };
+      };
 
-    console.log("current room id", roomId);
+      // Handle connection state changes
+      peerConnection.onconnectionstatechange = () => {
+        console.log(
+          `Connection state change: ${peerConnection.connectionState} for peer ${peerId}`
+        );
 
-    return peerConnection;
+        if (peerConnection.connectionState === "connected") {
+          console.log(`Connection to peer ${peerId} established`);
+          setConnectionStatus("connected");
+        } else if (
+          peerConnection.connectionState === "failed" ||
+          peerConnection.connectionState === "closed"
+        ) {
+          console.log(`Connection to peer ${peerId} failed or closed`);
+
+          // Close and remove this peer connection
+          try {
+            peerConnections.current[peerId]?.close();
+          } catch (err) {
+            console.error(`Error closing peer connection:`, err);
+          }
+          delete peerConnections.current[peerId];
+
+          // Only set status to failed if all connections are failed/closed
+          const allConnectionsFailed = Object.values(
+            peerConnections.current
+          ).every(
+            (pc) =>
+              pc.connectionState === "failed" || pc.connectionState === "closed"
+          );
+
+          if (
+            allConnectionsFailed ||
+            Object.keys(peerConnections.current).length === 0
+          ) {
+            setConnectionStatus("failed");
+          }
+        }
+      };
+
+      // Handle signaling state changes
+      peerConnection.onsignalingstatechange = () => {
+        console.log(
+          `Signaling state change: ${peerConnection.signalingState} for peer ${peerId}`
+        );
+      };
+
+      // Handle negotiation needed
+      peerConnection.onnegotiationneeded = async () => {
+        if (initiator && roomId && user) {
+          console.log(`Negotiation needed for peer ${peerId}, creating offer`);
+          try {
+            // If not in stable state, wait for it
+            if (peerConnection.signalingState !== "stable") {
+              console.log(`Connection not stable, delaying offer creation`);
+              return;
+            }
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+
+            console.log(`Sending offer to peer ${peerId}:`, offer);
+            const offerRef = ref(
+              rtdb,
+              `rooms/${roomId}/offers/${user.uid}/${peerId}`
+            );
+            await set(offerRef, {
+              type: "offer",
+              sdp: peerConnection.localDescription?.sdp,
+            });
+          } catch (error) {
+            console.error(
+              `Error during negotiation with peer ${peerId}:`,
+              error
+            );
+            setWebRTCError("Failed to negotiate connection. Please try again.");
+          }
+        }
+      };
+
+      // Handle incoming tracks
+      peerConnection.ontrack = (event) => {
+        console.log(
+          `Received track from peer ${peerId}:`,
+          event.track.kind,
+          event
+        );
+
+        // Important: We need to use the stream from the event for most browsers
+        // This is critical - using event.streams[0] if available is more reliable
+        let remoteStream: MediaStream;
+
+        if (event.streams && event.streams[0]) {
+          console.log(`Using event stream for peer ${peerId}`);
+          remoteStream = event.streams[0];
+        } else {
+          console.log(`Creating new stream for peer ${peerId}`);
+          remoteStream = new MediaStream();
+          remoteStream.addTrack(event.track);
+        }
+
+        setPeers((prevPeers) => {
+          const peerIndex = prevPeers.findIndex((p) => p.id === peerId);
+          if (peerIndex !== -1) {
+            const updatedPeers = [...prevPeers];
+            const existingPeer = updatedPeers[peerIndex];
+
+            // Always make sure we have the latest track
+            console.log(
+              `Adding ${event.track.kind} track to peer ${peerId} stream`
+            );
+
+            // Listen for track ended events
+            event.track.onended = () => {
+              console.log(
+                `Track ${event.track.kind} from peer ${peerId} ended`
+              );
+            };
+
+            // Listen for mute/unmute events
+            event.track.onmute = () => {
+              console.log(
+                `Track ${event.track.kind} from peer ${peerId} muted`
+              );
+            };
+
+            event.track.onunmute = () => {
+              console.log(
+                `Track ${event.track.kind} from peer ${peerId} unmuted`
+              );
+            };
+
+            updatedPeers[peerIndex] = {
+              ...existingPeer,
+              stream: remoteStream,
+              connection: peerConnection,
+            };
+
+            console.log(`Updated peer ${peerId} with stream:`, remoteStream);
+            return updatedPeers;
+          }
+          return prevPeers;
+        });
+      };
+
+      return peerConnection;
+    } catch (error) {
+      console.error(`Error creating peer connection to ${peerId}:`, error);
+      setWebRTCError("Failed to create peer connection. Please try again.");
+      return null;
+    }
   };
 
   // Set up WebRTC listeners
@@ -1156,56 +1477,167 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
               console.log({ senderId, userId: user.uid });
               if (senderId !== user.uid) {
                 Object.entries(senderOffers).forEach(
-                  ([receiverId, offer]: [string, any]) => {
+                  async ([receiverId, offer]: [string, any]) => {
                     if (receiverId === user.uid && offer) {
                       console.log(`Received offer from ${senderId}:`, offer);
 
                       // Create peer connection if it doesn't exist
-                      const peerConnection =
-                        peerConnections.current[senderId] ||
-                        createPeerConnection(senderId, roomId, false);
-                      if (peerConnection.signalingState !== "stable") {
-                        console.warn(
-                          `Skipping offer from ${senderId}, signalingState: ${peerConnection.signalingState}`
+                      let peerConnection = peerConnections.current[senderId];
+
+                      if (!peerConnection) {
+                        console.log(
+                          `Creating new peer connection for ${senderId} in response to offer`
                         );
-                        return; // Don't process if not in the correct state
+                        const newConnection = createPeerConnection(
+                          senderId,
+                          roomId,
+                          false
+                        );
+
+                        if (newConnection) {
+                          peerConnection = newConnection;
+                        } else {
+                          console.error(
+                            `Failed to create peer connection for ${senderId}`
+                          );
+                          return;
+                        }
                       }
-                      // Set remote description and create answer
-                      peerConnection
-                        .setRemoteDescription(
-                          new RTCSessionDescription({
-                            type: "offer",
-                            sdp: offer.sdp,
-                          })
-                        )
-                        .then(() => {
-                          console.log(`Creating answer for ${senderId}`);
-                          return peerConnection.createAnswer();
-                        })
-                        .then((answer) => {
+
+                      if (!peerConnection) {
+                        console.error(
+                          `Failed to create peer connection for ${senderId}`
+                        );
+                        return;
+                      }
+
+                      // Ensure we have a valid RTCPeerConnection before proceeding
+                      if (!(peerConnection instanceof RTCPeerConnection)) {
+                        console.error(
+                          `Invalid peer connection type for ${senderId}, recreating connection`
+                        );
+                        // Try to recreate the connection
+                        let newConnection = createPeerConnection(
+                          senderId,
+                          roomId,
+                          false
+                        );
+                        if (!newConnection) {
+                          console.error(
+                            `Failed to recreate peer connection for ${senderId}`
+                          );
+                          return;
+                        }
+                        peerConnection = newConnection;
+                      }
+
+                      // Check if we're in a state where we can process the offer
+                      if (
+                        peerConnection.signalingState === "have-local-offer"
+                      ) {
+                        console.log(
+                          `Signaling state conflict with ${senderId}, resolving glare situation`
+                        );
+
+                        // Glare situation: both peers created an offer
+                        // Compare user IDs to determine who should accept and who should create a new offer
+                        if (user.uid > senderId) {
                           console.log(
-                            `Setting local description (answer) for ${senderId}:`,
-                            answer
+                            `This client (${user.uid}) wins glare resolution, waiting for remote to process our offer`
                           );
-                          return peerConnection.setLocalDescription(answer);
-                        })
-                        .then(() => {
-                          console.log(`Sending answer to ${senderId}`);
-                          const answerRef = ref(
-                            rtdb,
-                            `rooms/${roomId}/answers/${user.uid}/${senderId}`
+                          return; // Let the other peer process our offer first
+                        } else {
+                          console.log(
+                            `Remote peer (${senderId}) wins glare resolution, rolling back our offer`
                           );
-                          return set(answerRef, {
-                            type: "answer",
-                            sdp: peerConnection.localDescription?.sdp,
-                          });
-                        })
-                        .catch((error) => {
-                          console.error("Error creating answer:", error);
-                          setWebRTCError(
-                            "Failed to respond to connection offer. Please try again."
-                          );
-                        });
+                          try {
+                            await peerConnection.setLocalDescription({
+                              type: "rollback",
+                            });
+                          } catch (err) {
+                            console.error(
+                              `Error rolling back local description:`,
+                              err
+                            );
+
+                            // If rollback fails, create a new connection
+                            try {
+                              peerConnection.close();
+                            } catch (closeErr) {
+                              console.error(
+                                `Error closing connection:`,
+                                closeErr
+                              );
+                            }
+
+                            delete peerConnections.current[senderId];
+                            const newConnection = createPeerConnection(
+                              senderId,
+                              roomId,
+                              false
+                            );
+
+                            if (newConnection) {
+                              peerConnection = newConnection;
+                            } else {
+                              console.error(
+                                `Failed to create peer connection for ${senderId}`
+                              );
+                              return;
+                            }
+                            if (!peerConnection) {
+                              console.error(
+                                `Failed to recreate peer connection for ${senderId}`
+                              );
+                              return;
+                            }
+                          }
+                        }
+                      } else if (peerConnection.signalingState !== "stable") {
+                        console.log(
+                          `Cannot process offer in current signaling state: ${peerConnection.signalingState}`
+                        );
+
+                        // If we're in a weird state, wait a bit and check again
+                        setTimeout(async () => {
+                          if (peerConnection.signalingState !== "stable") {
+                            console.log(
+                              `Still in unstable state (${peerConnection.signalingState}), resetting connection`
+                            );
+                            try {
+                              peerConnection.close();
+                            } catch (err) {
+                              console.error(
+                                `Error closing unstable connection:`,
+                                err
+                              );
+                            }
+
+                            delete peerConnections.current[senderId];
+                            const newPeerConnection = createPeerConnection(
+                              senderId,
+                              roomId,
+                              false
+                            );
+                            if (!newPeerConnection) {
+                              console.error(
+                                `Failed to recreate peer connection for ${senderId}`
+                              );
+                              return;
+                            }
+
+                            if (
+                              newPeerConnection instanceof RTCPeerConnection
+                            ) {
+                              processOffer(newPeerConnection, senderId, offer);
+                            }
+                          }
+                        }, 1000);
+                        return;
+                      }
+
+                      // Process the offer
+                      processOffer(peerConnection, senderId, offer);
                     }
                   }
                 );
@@ -1223,6 +1655,54 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
     );
     offersUnsubscribeRef.current = offersUnsubscribe;
 
+    // Helper function to process an offer
+    const processOffer = async (
+      peerConnection: RTCPeerConnection | null,
+      senderId: string,
+      offer: any
+    ) => {
+      if (!peerConnection) {
+        console.error(
+          `Cannot process offer: Missing peer connection for ${senderId}`
+        );
+        return;
+      }
+      try {
+        // Set remote description and create answer
+        console.log(`Setting remote description for ${senderId}`);
+        await peerConnection.setRemoteDescription(
+          new RTCSessionDescription({
+            type: "offer",
+            sdp: offer.sdp,
+          })
+        );
+
+        console.log(`Creating answer for ${senderId}`);
+        const answer = await peerConnection.createAnswer();
+
+        console.log(
+          `Setting local description (answer) for ${senderId}`,
+          answer
+        );
+        await peerConnection.setLocalDescription(answer);
+
+        console.log(`Sending answer to ${senderId}`);
+        const answerRef = ref(
+          rtdb,
+          `rooms/${roomId}/answers/${user.uid}/${senderId}`
+        );
+        await set(answerRef, {
+          type: "answer",
+          sdp: peerConnection.localDescription?.sdp,
+        });
+      } catch (error) {
+        console.error(`Error processing offer from ${senderId}:`, error);
+        setWebRTCError(
+          "Failed to respond to connection offer. Please try again."
+        );
+      }
+    };
+
     // Listen for answers
     console.log("Setting up answers listener");
     const answersRef = ref(rtdb, `rooms/${roomId}/answers`);
@@ -1236,36 +1716,83 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           Object.entries(answers).forEach(
             ([senderId, senderAnswers]: [string, any]) => {
               Object.entries(senderAnswers).forEach(
-                ([receiverId, answer]: [string, any]) => {
+                async ([receiverId, answer]: [string, any]) => {
                   if (receiverId === user.uid && answer) {
                     console.log(`Received answer from ${senderId}:`, answer);
                     const peerConnection = peerConnections.current[senderId];
 
-                    if (
-                      peerConnection &&
-                      peerConnection.signalingState === "have-local-offer"
-                    ) {
-                      peerConnection
-                        .setRemoteDescription(
+                    if (!peerConnection) {
+                      console.warn(
+                        `Received answer from ${senderId} but no peer connection exists`
+                      );
+                      return;
+                    }
+
+                    if (peerConnection.signalingState === "have-local-offer") {
+                      try {
+                        await peerConnection.setRemoteDescription(
                           new RTCSessionDescription({
                             type: "answer",
                             sdp: answer.sdp,
                           })
-                        )
-                        .then(() => {
-                          console.log(
-                            `Set remote description (answer) for ${senderId}`
+                        );
+                        console.log(
+                          `Set remote description (answer) for ${senderId}`
+                        );
+
+                        // Remove the processed answer to avoid re-processing
+                        const processedAnswerRef = ref(
+                          rtdb,
+                          `rooms/${roomId}/answers/${senderId}/${receiverId}`
+                        );
+                        await remove(processedAnswerRef);
+                      } catch (error) {
+                        console.error(
+                          `Error setting remote description for ${senderId}:`,
+                          error
+                        );
+                        setWebRTCError(
+                          "Failed to establish connection. Please try again."
+                        );
+
+                        // If the error is serious, try to recreate the connection
+                        if (
+                          String(error).includes(
+                            "Failed to set remote answer sdp:"
+                          ) ||
+                          String(error).includes(
+                            "Failed to set remote description"
+                          )
+                        ) {
+                          try {
+                            console.log(
+                              `Recreating failed connection to ${senderId}`
+                            );
+                            peerConnection.close();
+                          } catch (closeErr) {
+                            console.error(
+                              `Error closing failed connection:`,
+                              closeErr
+                            );
+                          }
+
+                          delete peerConnections.current[senderId];
+                          const newPeerConnection = createPeerConnection(
+                            senderId,
+                            roomId,
+                            true
                           );
-                        })
-                        .catch((error) => {
-                          console.error(
-                            "Error setting remote description:",
-                            error
-                          );
-                          setWebRTCError(
-                            "Failed to establish connection. Please try again."
-                          );
-                        });
+                          if (newPeerConnection) {
+                            console.log(
+                              `Successfully recreated connection to ${senderId}`
+                            );
+                          }
+                        }
+                      }
+                    } else {
+                      console.warn(
+                        `Skipping answer from ${senderId}, signalingState: ${peerConnection.signalingState}`
+                      );
                     }
                   }
                 }
@@ -1301,22 +1828,61 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
 
                     if (peerConnection) {
                       Object.values(receiverCandidates).forEach(
-                        (candidate: any) => {
-                          console.log(
-                            `Adding ICE candidate from ${senderId}:`,
-                            candidate
-                          );
-                          peerConnection
-                            .addIceCandidate(new RTCIceCandidate(candidate))
-                            .catch((error) => {
-                              console.error(
-                                "Error adding ICE candidate:",
-                                error
+                        async (candidate: any) => {
+                          try {
+                            // Ensure connection is ready to receive candidates
+                            if (!peerConnection.remoteDescription) {
+                              console.log(
+                                `Remote description not set for ${senderId}, queuing ICE candidate`
                               );
+                              return; // Skip for now, will be retried later
+                            }
+
+                            console.log(
+                              `Adding ICE candidate from ${senderId}`,
+                              candidate
+                            );
+                            await peerConnection.addIceCandidate(
+                              new RTCIceCandidate(candidate)
+                            );
+
+                            // Clean up processed candidate
+                            const candidateKeys =
+                              Object.keys(receiverCandidates);
+                            if (candidateKeys.length > 0) {
+                              const candidateKey = candidateKeys.find(
+                                (key) =>
+                                  JSON.stringify(receiverCandidates[key]) ===
+                                  JSON.stringify(candidate)
+                              );
+                              if (candidateKey) {
+                                const processedCandidateRef = ref(
+                                  rtdb,
+                                  `rooms/${roomId}/candidates/${senderId}/${receiverId}/${candidateKey}`
+                                );
+                                await remove(processedCandidateRef);
+                              }
+                            }
+                          } catch (error) {
+                            console.error(
+                              `Error adding ICE candidate from ${senderId}:`,
+                              error
+                            );
+
+                            // Don't show error message for minor ICE issues
+                            if (
+                              String(error).includes(
+                                "Cannot add ICE candidate"
+                              ) &&
+                              !String(error).includes("Connection failed")
+                            ) {
+                              console.log(`Non-critical ICE error: ${error}`);
+                            } else {
                               setWebRTCError(
-                                "Failed to establish connection. Please try again."
+                                "Connection issue. Try reconnecting if video doesn't appear."
                               );
-                            });
+                            }
+                          }
                         }
                       );
                     }
@@ -1435,7 +2001,12 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
     console.log(`WebRTC joining room: ${roomId}`);
 
     try {
-      // Clean up any existing signaling data
+      // First, close any existing peer connections and clear state
+      Object.values(peerConnections.current).forEach((pc) => pc.close());
+      peerConnections.current = {};
+      setPeers([]);
+
+      // Clean up any existing signaling data - must happen before initializing new connections
       await cleanupSignalingData(roomId, user.uid);
 
       // Initialize local stream if not already done
@@ -1449,17 +2020,20 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
           joinAttemptedRef.current = false;
           throw new Error(error);
         }
+      } else {
+        // Re-enable tracks in case they were disabled
+        localStream.getVideoTracks().forEach((track) => {
+          if (track) track.enabled = isVideoEnabled;
+        });
+        localStream.getAudioTracks().forEach((track) => {
+          if (track) track.enabled = isAudioEnabled;
+        });
       }
 
       // Set current room ID
       setCurrentRoomId(roomId);
 
-      // Clear existing peer connections
-      Object.values(peerConnections.current).forEach((pc) => pc.close());
-      peerConnections.current = {};
-      // setPeers([]);
-
-      // Add user to room participants
+      // Add user to room participants - this will trigger the participant listener in other clients
       console.log(`Adding user ${user.uid} to room participants`);
       const participantRef = ref(
         rtdb,
@@ -1472,11 +2046,164 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
 
       // Set up disconnect handler
       onDisconnect(participantRef).remove();
-      console.log("Setting up disconnect handler", currentRoomId);
-      // Set up WebRTC listeners
+
+      // Get existing participants first
+      const roomParticipantsRef = ref(rtdb, `rooms/${roomId}/participants`);
+      const snapshot = await get(roomParticipantsRef);
+
+      // Set up peers array first before creating connections
+      if (snapshot.exists()) {
+        const participants = snapshot.val();
+        console.log(
+          `Found ${Object.keys(participants).length} participants in room`
+        );
+
+        // Add peers to state first without creating connections
+        Object.entries(participants).forEach(
+          ([id, participant]: [string, any]) => {
+            if (id !== user.uid) {
+              setPeers((prevPeers) => {
+                if (!prevPeers.some((p) => p.id === id)) {
+                  return [
+                    ...prevPeers,
+                    {
+                      id,
+                      displayName: participant.displayName || "Anonymous",
+                    },
+                  ];
+                }
+                return prevPeers;
+              });
+            }
+          }
+        );
+      }
+
+      // Set up WebRTC listeners before creating connections
       setupWebRTCListeners(roomId, currentRoom);
 
+      // Wait a moment for the user to be established in the room
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Now create connections to all participants
+      if (snapshot.exists()) {
+        const participants = snapshot.val();
+
+        // Create peer connections to all participants except self
+        for (const [id, participant] of Object.entries(participants)) {
+          if (id !== user.uid) {
+            console.log(`Creating initial connection to participant: ${id}`);
+            // Create a small delay to ensure previous setup is complete
+            await new Promise((resolve) => setTimeout(resolve, 300));
+
+            const peerConnection = createPeerConnection(id, roomId, true);
+
+            if (peerConnection) {
+              try {
+                // Set up the icecandidate event handler before creating the offer
+                // (this should already be set in createPeerConnection but we're making sure)
+                peerConnection.onicecandidate = (event) => {
+                  if (event.candidate) {
+                    console.log(
+                      `Generated ICE candidate for peer ${id}:`,
+                      event.candidate
+                    );
+                    const candidateRef = ref(
+                      rtdb,
+                      `rooms/${roomId}/candidates/${user.uid}/${id}`
+                    );
+                    push(candidateRef, event.candidate.toJSON());
+                  }
+                };
+
+                console.log(`Creating offer for peer ${id} with options`);
+                const offerOptions = {
+                  offerToReceiveAudio: true,
+                  offerToReceiveVideo: true,
+                };
+
+                const offer = await peerConnection.createOffer();
+                console.log(`Offer created for peer ${id}`);
+                await peerConnection.setLocalDescription(offer);
+
+                // Allow a bit more time for the local description to be set properly
+                await new Promise((resolve) => setTimeout(resolve, 200));
+
+                if (peerConnection.localDescription) {
+                  // Send the offer to the remote peer
+                  const offerRef = ref(
+                    rtdb,
+                    `rooms/${roomId}/offers/${user.uid}/${id}`
+                  );
+                  await set(offerRef, {
+                    type: "offer",
+                    sdp: peerConnection.localDescription.sdp,
+                  });
+
+                  console.log(`Sent offer to participant ${id}`);
+                } else {
+                  console.error(`LocalDescription is null for peer ${id}`);
+                }
+              } catch (error) {
+                console.error(`Error creating/sending offer to ${id}:`, error);
+
+                // If there's an error with max-bundle, try again with a different configuration
+                if (String(error).includes("no BUNDLE group")) {
+                  console.log(
+                    `Retrying with modified configuration for peer ${id}`
+                  );
+                  try {
+                    // Close the problematic connection
+                    peerConnection.close();
+                    delete peerConnections.current[id];
+
+                    // Create a new connection with simpler configuration
+                    const simpleConfig = {
+                      iceServers: [{ urls: "stun:stun1.l.google.com:19302" }],
+                      bundlePolicy: "balanced" as RTCBundlePolicy,
+                    };
+
+                    const newConnection = new RTCPeerConnection(simpleConfig);
+                    peerConnections.current[id] = newConnection;
+
+                    // Add tracks from local stream
+                    if (localStream) {
+                      localStream.getTracks().forEach((track) => {
+                        newConnection.addTrack(track, localStream);
+                      });
+                    }
+
+                    // Create and send offer with the simpler connection
+                    const newOffer = await newConnection.createOffer();
+                    await newConnection.setLocalDescription(newOffer);
+
+                    const offerRef = ref(
+                      rtdb,
+                      `rooms/${roomId}/offers/${user.uid}/${id}`
+                    );
+                    await set(offerRef, {
+                      type: "offer",
+                      sdp: newConnection.localDescription?.sdp,
+                    });
+
+                    console.log(`Sent alternative offer to participant ${id}`);
+                  } catch (retryError) {
+                    console.error(`Failed retry with peer ${id}:`, retryError);
+                  }
+                }
+              }
+            } else {
+              console.error(`Failed to create peer connection for ${id}`);
+            }
+
+            // Add a small delay between connection creations to avoid race conditions
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+      }
+
       console.log(`Successfully joined WebRTC room: ${roomId}`);
+      setConnectionStatus("connected");
       joinAttemptsRef.current = 0;
     } catch (error) {
       console.error("Error in WebRTC joinRoom:", error);
@@ -1491,45 +2218,67 @@ export const WebRTCProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   // Leave room
-  const leaveRoom = () => {
+  const leaveRoom = async () => {
     if (!currentRoomId || !user) return;
 
     console.log(`Leaving WebRTC room: ${currentRoomId}`);
 
-    // Remove user from room
-    const participantRef = ref(
-      rtdb,
-      `rooms/${currentRoomId}/participants/${user.uid}`
-    );
-    remove(participantRef);
+    try {
+      // Clean up signaling data first to prevent race conditions
+      await cleanupSignalingData(currentRoomId, user.uid);
 
-    // Clean up WebRTC listeners
-    cleanupWebRTCListeners();
+      // Remove user from room
+      const participantRef = ref(
+        rtdb,
+        `rooms/${currentRoomId}/participants/${user.uid}`
+      );
+      await remove(participantRef);
 
-    // Close all peer connections
-    Object.values(peerConnections.current).forEach((pc) => {
-      pc.close();
-    });
+      // Clean up WebRTC listeners
+      cleanupWebRTCListeners();
 
-    peerConnections.current = {};
-    setPeers([]);
-    setCurrentRoomId(null);
-    console.log("Dsconnecting fromh here instead");
-    setConnectionStatus("disconnected");
+      // Close all peer connections
+      Object.values(peerConnections.current).forEach((pc) => {
+        try {
+          pc.close();
+        } catch (err) {
+          console.error("Error closing peer connection:", err);
+        }
+      });
 
-    // Stop screen sharing if active
-    if (isScreenSharing) {
-      toggleScreenShare();
+      peerConnections.current = {};
+      setPeers([]);
+
+      // Stop screen sharing if active
+      if (isScreenSharing && screenShareStream.current) {
+        screenShareStream.current.getTracks().forEach((track) => track.stop());
+        screenShareStream.current = null;
+      }
+
+      // Stop recording if active
+      if (isRecording && mediaRecorder.current) {
+        try {
+          mediaRecorder.current.stop();
+        } catch (err) {
+          console.error("Error stopping media recorder:", err);
+        }
+      }
+
+      // Final state updates
+      setCurrentRoomId(null);
+      setConnectionStatus("disconnected");
+      joinAttemptedRef.current = false;
+      joinAttemptsRef.current = 0;
+
+      console.log("WebRTC room left successfully");
+    } catch (error) {
+      console.error("Error while leaving room:", error);
+      // Still reset state even if there's an error
+      setCurrentRoomId(null);
+      setConnectionStatus("disconnected");
+      joinAttemptedRef.current = false;
+      joinAttemptsRef.current = 0;
     }
-
-    // Stop recording if active
-    if (isRecording) {
-      toggleRecording();
-    }
-
-    joinAttemptedRef.current = false;
-    joinAttemptsRef.current = 0;
-    console.log("WebRTC room left successfully");
   };
 
   // Clean up on unmount

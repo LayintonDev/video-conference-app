@@ -1226,19 +1226,40 @@ export default function RoomPage() {
 
 const PeerVideo = ({ stream }: { stream: MediaStream }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
-  console.log("stream here:", stream);
+  const [hasVideo, setHasVideo] = useState(false);
+  const [hasAudio, setHasAudio] = useState(false);
+
+  console.log("Rendering PeerVideo with stream:", stream);
 
   useEffect(() => {
-    if (videoRef.current && stream) {
-      // Check if stream has video tracks
-      const hasVideoTrack = stream.getVideoTracks().length > 0;
+    if (!stream) {
+      console.log("No stream provided to PeerVideo");
+      return;
+    }
 
-      if (hasVideoTrack) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play().catch((error) => {
-          console.error("Error playing video:", error);
-        });
-      }
+    // Log all tracks
+    const videoTracks = stream.getVideoTracks();
+    const audioTracks = stream.getAudioTracks();
+    console.log(
+      `Stream has ${videoTracks.length} video tracks and ${audioTracks.length} audio tracks`
+    );
+
+    videoTracks.forEach((track) => {
+      console.log("Video track:", track.id, track.enabled, track.readyState);
+    });
+
+    audioTracks.forEach((track) => {
+      console.log("Audio track:", track.id, track.enabled, track.readyState);
+    });
+
+    setHasVideo(videoTracks.length > 0);
+    setHasAudio(audioTracks.length > 0);
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch((error) => {
+        console.error("Error playing video:", error);
+      });
     }
 
     // Cleanup the stream when component is unmounted or stream changes
@@ -1250,11 +1271,34 @@ const PeerVideo = ({ stream }: { stream: MediaStream }) => {
   }, [stream]);
 
   return (
-    <video
-      ref={videoRef}
-      autoPlay
-      playsInline
-      className="h-full w-full object-cover"
-    />
+    <div className="relative h-full w-full">
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        className={`h-full w-full object-cover ${!hasVideo ? "hidden" : ""}`}
+      />
+
+      {/* Display avatar if no video */}
+      {!hasVideo && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-800 text-white">
+          <div className="text-center">
+            <Avatar className="h-20 w-20 mx-auto">
+              <AvatarFallback className="text-2xl bg-primary">
+                {hasAudio ? "A" : "?"}
+              </AvatarFallback>
+            </Avatar>
+            <p className="mt-2">Audio Only</p>
+          </div>
+        </div>
+      )}
+
+      {/* Audio indicator */}
+      {hasAudio && (
+        <div className="absolute bottom-2 right-2 bg-black/50 px-2 py-1 rounded text-white text-xs">
+          <Mic className="h-3 w-3" />
+        </div>
+      )}
+    </div>
   );
 };
